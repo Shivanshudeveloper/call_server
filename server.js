@@ -18,8 +18,6 @@ if (!connectionString) {
 
 const identityClient = new CommunicationIdentityClient(connectionString);
 
-// Serve static files from the React app build (after you run `npm run build` in client)
-app.use(express.static(path.join(__dirname, 'client/build')));
 
 app.get('/token', async (req, res) => {
   try {

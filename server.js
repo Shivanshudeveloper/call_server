@@ -36,10 +36,6 @@ app.get('/token', async (req, res) => {
   }
 });
 
-// Catch-all: return React index file if no other route matches
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'client/build', 'index.html'));
-});
 
 const port = process.env.PORT || 8080;
 app.listen(port, () => {

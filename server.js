@@ -9,7 +9,7 @@ const app = express();
 
 app.use(cors());
 
-// Replace with your connection string (or use environment variable):
+// Replace with your connection string (or use environment variable)
 const connectionString = process.env.ACS_CONNECTION_STRING; 
 if (!connectionString) {
     console.error("Please set the ACS_CONNECTION_STRING in your .env file!");

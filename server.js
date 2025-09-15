@@ -14,6 +14,7 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 const app = express();
 app.use(cors());
 
+// String
 const connectionString = process.env.ACS_CONNECTION_STRING; 
 if (!connectionString) {
     console.error("Please set the ACS_CONNECTION_STRING in your .env file!");

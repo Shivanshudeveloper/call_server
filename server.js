@@ -13,6 +13,23 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
 app.use(cors());
+app.use(express.json());
+
+// Request logging middleware
+app.use((req, res, next) => {
+  const requestId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  req.requestId = requestId;
+  const startTime = Date.now();
+  
+  console.log(`[${requestId}] ${req.method} ${req.path} - Started`);
+  
+  res.on('finish', () => {
+    const duration = Date.now() - startTime;
+    console.log(`[${requestId}] ${req.method} ${req.path} - Completed ${res.statusCode} (${duration}ms)`);
+  });
+  
+  next();
+});
 
 // String
 const connectionString = process.env.ACS_CONNECTION_STRING; 
@@ -22,12 +39,37 @@ if (!connectionString) {
 }
 
 const identityClient = new CommunicationIdentityClient(connectionString);
-const upload = multer(); // for handling multipart form data in-memory
 
+// Configure multer with limits for concurrent uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB max file size
+    files: 1
+  }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'healthy', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
+
+// Token generation endpoint - supports concurrent requests
 app.get('/token', async (req, res) => {
+  const requestId = req.requestId;
+  
   try {
+    console.log(`[${requestId}] Creating new ACS user and token`);
+    
+    // Each request gets its own user identity - perfectly fine for concurrent requests
     const user = await identityClient.createUser();
     const tokenResponse = await identityClient.getToken(user, ["voip"]);
+
+    console.log(`[${requestId}] Token generated successfully for user: ${user.communicationUserId}`);
 
     res.json({
       userId: user.communicationUserId,
@@ -35,18 +77,34 @@ app.get('/token', async (req, res) => {
       expiresOn: tokenResponse.expiresOn
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).send("Error generating token");
+    console.error(`[${requestId}] Error generating token:`, error.message);
+    res.status(500).json({ 
+      error: "Error generating token",
+      message: error.message 
+    });
   }
 });
 
-// Function to convert webm to PCM buffer
-const convertWebmToPcm = (webmBuffer) => {
+// Function to convert webm to PCM buffer - handles concurrent conversions
+const convertWebmToPcm = (webmBuffer, requestId) => {
   return new Promise((resolve, reject) => {
+    const timeoutMs = 30000; // 30 second timeout
+    let isResolved = false;
+    
+    const timeout = setTimeout(() => {
+      if (!isResolved) {
+        isResolved = true;
+        console.error(`[${requestId}] FFmpeg conversion timeout after ${timeoutMs}ms`);
+        reject(new Error('Audio conversion timeout'));
+      }
+    }, timeoutMs);
+    
     const inputStream = new PassThrough();
     inputStream.end(webmBuffer);
 
     const pcmChunks = [];
+
+    console.log(`[${requestId}] Starting audio conversion (${(webmBuffer.length / 1024).toFixed(2)} KB)`);
 
     ffmpeg(inputStream)
       .inputFormat('webm')
@@ -55,37 +113,61 @@ const convertWebmToPcm = (webmBuffer) => {
       .audioFrequency(16000)
       .format('s16le')
       .on('error', (err) => {
-        console.error('Error converting audio:', err);
-        reject(err);
+        if (!isResolved) {
+          isResolved = true;
+          clearTimeout(timeout);
+          console.error(`[${requestId}] Error converting audio:`, err.message);
+          reject(err);
+        }
       })
       .pipe()
       .on('data', (chunk) => {
         pcmChunks.push(chunk);
       })
       .on('end', () => {
-        resolve(Buffer.concat(pcmChunks));
+        if (!isResolved) {
+          isResolved = true;
+          clearTimeout(timeout);
+          const totalSize = (Buffer.concat(pcmChunks).length / 1024).toFixed(2);
+          console.log(`[${requestId}] Audio conversion completed (${totalSize} KB PCM)`);
+          resolve(Buffer.concat(pcmChunks));
+        }
       })
       .on('error', (err) => {
-        console.error('Error in ffmpeg pipe:', err);
-        reject(err);
+        if (!isResolved) {
+          isResolved = true;
+          clearTimeout(timeout);
+          console.error(`[${requestId}] Error in ffmpeg pipe:`, err.message);
+          reject(err);
+        }
       });
   });
 };
 
-// STT endpoint
+// STT endpoint - handles concurrent transcription requests
 app.post('/stt', upload.single('audio'), async (req, res) => {
+  const requestId = req.requestId;
+  let recognizer = null;
+  
   try {
     const speechKey = process.env.SPEECH_KEY;
     const speechRegion = process.env.SPEECH_REGION;
 
     if (!speechKey || !speechRegion) {
+      console.error(`[${requestId}] Speech service credentials not configured`);
       return res.status(500).json({ error: 'Speech service credentials not set.' });
     }
 
-    const audioBuffer = req.file.buffer;
+    if (!req.file || !req.file.buffer) {
+      console.error(`[${requestId}] No audio file provided`);
+      return res.status(400).json({ error: 'No audio file provided' });
+    }
 
-    // Convert webm to PCM
-    const pcmBuffer = await convertWebmToPcm(audioBuffer);
+    const audioBuffer = req.file.buffer;
+    console.log(`[${requestId}] Received audio file: ${req.file.originalname || 'unnamed'} (${(audioBuffer.length / 1024).toFixed(2)} KB)`);
+
+    // Convert webm to PCM - each request gets its own conversion
+    const pcmBuffer = await convertWebmToPcm(audioBuffer, requestId);
 
     // Create a push stream with the correct format
     const format = AudioStreamFormat.getWaveFormatPCM(16000, 16, 1);
@@ -99,24 +181,95 @@ app.post('/stt', upload.single('audio'), async (req, res) => {
     speechConfig.speechRecognitionLanguage = "en-US";
 
     const audioConfig = AudioConfig.fromStreamInput(pushStream);
-    const recognizer = new SpeechRecognizer(speechConfig, audioConfig);
+    recognizer = new SpeechRecognizer(speechConfig, audioConfig);
 
-    recognizer.recognizeOnceAsync(result => {
-      let text = '';
-      if (result && result.text) {
-        text = result.text;
-      }
-      recognizer.close();
-      return res.json({ text });
+    console.log(`[${requestId}] Starting speech recognition`);
+
+    // Wrap in promise with timeout for better error handling
+    const transcriptionPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Speech recognition timeout'));
+      }, 60000); // 60 second timeout
+
+      recognizer.recognizeOnceAsync(
+        result => {
+          clearTimeout(timeout);
+          let text = '';
+          if (result && result.text) {
+            text = result.text;
+          }
+          console.log(`[${requestId}] Transcription completed: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+          resolve(text);
+        },
+        error => {
+          clearTimeout(timeout);
+          console.error(`[${requestId}] Speech recognition error:`, error);
+          reject(error);
+        }
+      );
     });
 
+    const text = await transcriptionPromise;
+    
+    // Clean up recognizer
+    if (recognizer) {
+      recognizer.close();
+      recognizer = null;
+    }
+
+    return res.json({ text, requestId });
+
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Transcription error' });
+    console.error(`[${requestId}] Transcription error:`, error.message);
+    
+    // Clean up recognizer on error
+    if (recognizer) {
+      try {
+        recognizer.close();
+      } catch (closeError) {
+        console.error(`[${requestId}] Error closing recognizer:`, closeError.message);
+      }
+    }
+    
+    res.status(500).json({ 
+      error: 'Transcription error',
+      message: error.message,
+      requestId
+    });
   }
 });
 
+// Error handling for uncaught errors
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
 const port = process.env.PORT || 8080;
-app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
+const server = app.listen(port, () => {
+  console.log(`🚀 Call Server is running on port ${port}`);
+  console.log(`📞 Token endpoint: http://localhost:${port}/token`);
+  console.log(`🎙️  STT endpoint: http://localhost:${port}/stt`);
+  console.log(`💚 Health check: http://localhost:${port}/health`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM signal received: closing HTTP server');
+  server.close(() => {
+    console.log('HTTP server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT signal received: closing HTTP server');
+  server.close(() => {
+    console.log('HTTP server closed');
+    process.exit(0);
+  });
 });

@@ -3,6 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { CommunicationIdentityClient } = require('@azure/communication-identity');
+const { CallAutomationClient } = require('@azure/communication-call-automation');
 const multer = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
@@ -10,6 +11,9 @@ const { PassThrough } = require('stream');
 const { SpeechConfig, AudioConfig, SpeechRecognizer, PushAudioInputStream, AudioStreamFormat } = require('microsoft-cognitiveservices-speech-sdk');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
+
+// Initialize Call Automation Client for call transfer
+let callAutomationClient = null;
 
 const app = express();
 app.use(cors());
@@ -39,6 +43,14 @@ if (!connectionString) {
 }
 
 const identityClient = new CommunicationIdentityClient(connectionString);
+
+// Initialize Call Automation Client
+try {
+  callAutomationClient = new CallAutomationClient(connectionString);
+  console.log('Call Automation Client initialized successfully');
+} catch (error) {
+  console.error('Failed to initialize Call Automation Client:', error.message);
+}
 
 // Configure multer with limits for concurrent uploads
 const upload = multer({
@@ -82,6 +94,35 @@ app.get('/token', async (req, res) => {
       error: "Error generating token",
       message: error.message 
     });
+  }
+});
+
+// Callbacks endpoint for Call Automation events (kept for future use)
+app.post('/callbacks', async (req, res) => {
+  const requestId = req.requestId;
+  
+  try {
+    const events = Array.isArray(req.body) ? req.body : [req.body];
+    
+    for (const event of events) {
+      console.log(`[${requestId}] Received callback event:`, event.type || 'unknown');
+      
+      // Handle different event types as needed
+      if (event.type === 'Microsoft.Communication.CallConnected') {
+        console.log(`[${requestId}] Call connected`);
+      } else if (event.type === 'Microsoft.Communication.CallDisconnected') {
+        console.log(`[${requestId}] Call disconnected`);
+      } else if (event.type === 'Microsoft.Communication.CallTransferAccepted') {
+        console.log(`[${requestId}] Call transfer accepted`);
+      } else if (event.type === 'Microsoft.Communication.CallTransferFailed') {
+        console.log(`[${requestId}] Call transfer failed`);
+      }
+    }
+    
+    res.sendStatus(200);
+  } catch (error) {
+    console.error(`[${requestId}] Callback error:`, error);
+    res.sendStatus(500);
   }
 });
 
@@ -253,6 +294,7 @@ const server = app.listen(port, () => {
   console.log(`🚀 Call Server is running on port ${port}`);
   console.log(`📞 Token endpoint: http://localhost:${port}/token`);
   console.log(`🎙️  STT endpoint: http://localhost:${port}/stt`);
+  console.log(`📲 Callbacks endpoint: http://localhost:${port}/callbacks`);
   console.log(`💚 Health check: http://localhost:${port}/health`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });

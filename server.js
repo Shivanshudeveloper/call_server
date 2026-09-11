@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const { CommunicationIdentityClient } = require('@azure/communication-identity');
 const { CallAutomationClient } = require('@azure/communication-call-automation');
+const appConfig = require('./config');
 const multer = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
@@ -98,6 +99,251 @@ app.get('/token', async (req, res) => {
 });
 
 // Callbacks endpoint for Call Automation events (kept for future use)
+// ─── Voicemail drop ─────────────────────────────────────────────────────────
+//
+// The Power Dialer places its calls from the browser, so Call Automation is not
+// part of the call until an agent asks for a voicemail drop. At that point we
+// attach to the ongoing call with connectCall(ServerCallLocator) and play the
+// agent's pre-recorded greeting into it.
+//
+// State lives in memory on purpose: a drop is seconds long, and if this process
+// restarts mid-drop the worst case is that the call simply carries on and the
+// agent hangs up manually. Nothing is lost that a database would have saved.
+
+const VOICEMAIL_DROPS = new Map();
+const DROP_TTL_MS = 10 * 60 * 1000;
+
+// ACS must be able to reach this to deliver events, so it has to be the public
+// URL of THIS service, not localhost. Set it in config.js; an environment
+// variable still wins where one exists, so a deployed host can override without
+// editing code.
+const CALLBACK_BASE_URL = String(
+  process.env.CALLBACK_BASE_URL || appConfig.CALLBACK_BASE_URL || ''
+).replace(/\/+$/, '');
+
+const pruneDrops = () => {
+  const cutoff = Date.now() - DROP_TTL_MS;
+  for (const [id, drop] of VOICEMAIL_DROPS) {
+    if (drop.updatedAt < cutoff) VOICEMAIL_DROPS.delete(id);
+  }
+};
+
+const setDropState = (dropId, state, extra = {}) => {
+  const drop = VOICEMAIL_DROPS.get(dropId);
+  if (!drop) return null;
+
+  Object.assign(drop, extra, { state, updatedAt: Date.now() });
+
+  // Stamp each stage so the log shows where the delay between the agent's click
+  // and the greeting actually goes, rather than leaving it to guesswork.
+  drop.timings = drop.timings || {};
+  if (drop.timings[state] === undefined) drop.timings[state] = Date.now() - drop.startedAt;
+
+  const since = `+${Date.now() - drop.startedAt}ms`;
+  console.log(`[voicemail:${dropId}] -> ${state} ${since}${extra.error ? ` (${extra.error})` : ''}`);
+  return drop;
+};
+
+const findDropByConnection = (callConnectionId) => {
+  if (!callConnectionId) return null;
+  for (const drop of VOICEMAIL_DROPS.values()) {
+    if (drop.callConnectionId === callConnectionId) return drop;
+  }
+  return null;
+};
+
+/** End our leg (and the call) once the greeting has finished or failed. */
+const finishDrop = async (drop, state, error) => {
+  setDropState(drop.dropId, state, error ? { error } : {});
+
+  const t = drop.timings || {};
+  console.log(
+    `[voicemail:${drop.dropId}] BREAKDOWN  connectCall=${t.connectCallReturned ?? '?'}ms  ` +
+    `callConnected=${t.playing ?? '?'}ms  finished=${t[state] ?? '?'}ms  ` +
+    `(playback itself = ${(t[state] ?? 0) - (t.playing ?? 0)}ms)`
+  );
+
+  try {
+    if (drop.callConnectionId) {
+      await callAutomationClient.getCallConnection(drop.callConnectionId).hangUp(true);
+    }
+  } catch (hangUpError) {
+    // The call may already be gone; that is the outcome we wanted anyway.
+    console.log(`[voicemail:${drop.dropId}] hangUp skipped: ${hangUpError.message}`);
+  }
+};
+
+/**
+ * Start a voicemail drop on a call the browser is already on.
+ *
+ * Returns immediately with a dropId; progress arrives asynchronously through
+ * /callbacks and can be polled from /voicemail/drop/:dropId.
+ */
+app.post('/voicemail/drop', async (req, res) => {
+  const requestId = req.requestId;
+  pruneDrops();
+
+  try {
+    const { serverCallId, voicemailUrl, voicemailId, targetPhone, organizationId, userEmail, leadId } = req.body || {};
+
+    if (!callAutomationClient) {
+      return res.status(503).json({ success: false, code: 'CALL_AUTOMATION_UNAVAILABLE', message: 'Call Automation is not configured.' });
+    }
+    if (!serverCallId) {
+      return res.status(400).json({ success: false, code: 'MISSING_SERVER_CALL_ID', message: 'serverCallId is required.' });
+    }
+    if (!voicemailUrl || !/^https:\/\//i.test(voicemailUrl)) {
+      return res.status(400).json({ success: false, code: 'INVALID_VOICEMAIL_URL', message: 'A public https voicemail URL is required.' });
+    }
+    if (!CALLBACK_BASE_URL || !/^https:\/\//i.test(CALLBACK_BASE_URL)) {
+      console.error(`[${requestId}] CALLBACK_BASE_URL is not set to a public https URL`);
+      return res.status(500).json({
+        success: false,
+        code: 'CALLBACK_URL_NOT_CONFIGURED',
+        message: 'This server is not configured with a public callback URL.',
+      });
+    }
+
+    const dropId = `vm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+    VOICEMAIL_DROPS.set(dropId, {
+      dropId,
+      state: 'connecting',
+      serverCallId,
+      voicemailUrl,
+      voicemailId: voicemailId || dropId,
+      targetPhone: targetPhone || null,
+      organizationId: organizationId || null,
+      userEmail: userEmail || null,
+      leadId: leadId || null,
+      callConnectionId: null,
+      error: null,
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+
+    console.log(`[${requestId}] [voicemail:${dropId}] connecting to serverCallId ${serverCallId}`);
+
+    let connectResult;
+    try {
+      connectResult = await callAutomationClient.connectCall(
+        { kind: 'serverCallLocator', id: serverCallId },
+        `${CALLBACK_BASE_URL}/callbacks`,
+        { operationContext: dropId }
+      );
+    } catch (connectError) {
+      setDropState(dropId, 'failed', { error: connectError.message });
+      console.error(`[${requestId}] [voicemail:${dropId}] connectCall failed:`, connectError.message);
+      return res.status(502).json({
+        success: false,
+        code: 'CONNECT_FAILED',
+        message: 'Could not attach to the call to play the voicemail.',
+        data: { dropId },
+      });
+    }
+
+    const callConnectionId =
+      connectResult?.callConnectionProperties?.callConnectionId ||
+      connectResult?.callConnection?.callConnectionId ||
+      null;
+
+    const drop = VOICEMAIL_DROPS.get(dropId);
+    if (drop) {
+      drop.timings = drop.timings || {};
+      drop.timings.connectCallReturned = Date.now() - drop.startedAt;
+      console.log(`[voicemail:${dropId}] connectCall returned +${drop.timings.connectCallReturned}ms`);
+    }
+
+    setDropState(dropId, 'connecting', { callConnectionId });
+
+    return res.status(202).json({ success: true, data: { dropId, callConnectionId } });
+  } catch (error) {
+    console.error(`[${requestId}] Voicemail drop error:`, error.message);
+    return res.status(500).json({ success: false, code: 'INTERNAL_ERROR', message: 'Internal server error.' });
+  }
+});
+
+/** Progress for one drop, polled by the dialer while it waits. */
+app.get('/voicemail/drop/:dropId', (req, res) => {
+  const drop = VOICEMAIL_DROPS.get(req.params.dropId);
+  if (!drop) {
+    return res.status(404).json({ success: false, message: 'Unknown drop' });
+  }
+  return res.status(200).json({
+    success: true,
+    data: {
+      dropId: drop.dropId,
+      state: drop.state,
+      error: drop.error,
+      elapsedMs: Date.now() - drop.startedAt,
+      timings: drop.timings || {},
+    },
+  });
+});
+
+/**
+ * Drive one drop forward from a Call Automation event.
+ * Returns true when the event belonged to a drop.
+ */
+const handleVoicemailDropEvent = async (type, data) => {
+  const operationContext = data && data.operationContext;
+  const callConnectionId = data && data.callConnectionId;
+
+  const drop =
+    (operationContext && VOICEMAIL_DROPS.get(operationContext)) || findDropByConnection(callConnectionId);
+
+  if (!drop) return false;
+
+  if (callConnectionId && !drop.callConnectionId) {
+    drop.callConnectionId = callConnectionId;
+  }
+
+  switch (type) {
+    case 'Microsoft.Communication.CallConnected': {
+      if (drop.state !== 'connecting') return true;
+      setDropState(drop.dropId, 'playing');
+
+      try {
+        // playToAll rather than a targeted play: the agent is muted and waiting,
+        // so hearing the greeting confirms it actually went out, and it avoids
+        // depending on an exact participant identifier match.
+        await callAutomationClient
+          .getCallConnection(drop.callConnectionId)
+          .getCallMedia()
+          .playToAll(
+            [{ kind: 'fileSource', url: drop.voicemailUrl, playSourceCacheId: drop.voicemailId }],
+            { operationContext: drop.dropId, loop: false }
+          );
+      } catch (playError) {
+        await finishDrop(drop, 'failed', playError.message);
+      }
+      return true;
+    }
+
+    case 'Microsoft.Communication.PlayCompleted':
+      await finishDrop(drop, 'completed');
+      return true;
+
+    case 'Microsoft.Communication.PlayFailed':
+      await finishDrop(drop, 'failed', (data && data.resultInformation && data.resultInformation.message) || 'Play failed');
+      return true;
+
+    case 'Microsoft.Communication.ConnectFailed':
+      setDropState(drop.dropId, 'failed', { error: 'Could not connect to the call' });
+      return true;
+
+    case 'Microsoft.Communication.CallDisconnected':
+      // Completion already hung up; anything else means the call ended early.
+      if (drop.state !== 'completed') {
+        setDropState(drop.dropId, drop.state === 'playing' ? 'interrupted' : 'failed');
+      }
+      return true;
+
+    default:
+      return true;
+  }
+};
+
 app.post('/callbacks', async (req, res) => {
   const requestId = req.requestId;
   
@@ -106,6 +352,15 @@ app.post('/callbacks', async (req, res) => {
     
     for (const event of events) {
       console.log(`[${requestId}] Received callback event:`, event.type || 'unknown');
+
+      // Voicemail drops own their events; everything else falls through to the
+      // original logging below so existing behaviour is unchanged.
+      try {
+        const handled = await handleVoicemailDropEvent(event.type, event.data || event);
+        if (handled) continue;
+      } catch (dropError) {
+        console.error(`[${requestId}] Voicemail drop event error:`, dropError.message);
+      }
       
       // Handle different event types as needed
       if (event.type === 'Microsoft.Communication.CallConnected') {
@@ -289,7 +544,7 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-const port = process.env.PORT || 8080;
+const port = process.env.PORT || 8081;
 const server = app.listen(port, () => {
   console.log(`🚀 Call Server is running on port ${port}`);
   console.log(`📞 Token endpoint: http://localhost:${port}/token`);

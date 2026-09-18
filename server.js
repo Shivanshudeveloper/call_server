@@ -344,6 +344,325 @@ const handleVoicemailDropEvent = async (type, data) => {
   }
 };
 
+// ─── Force-remove a participant ──────────────────────────────────────────────
+//
+// The browser Calling SDK cannot reliably drop a PSTN participant that has not
+// answered yet. While an invite sits in Connecting/Ringing, removeParticipant
+// and hangUp are both known to be no-ops against PSTN legs, so a number that
+// simply rings forever - one with no voicemail to answer it - can be neither
+// removed from the roster nor stopped from ringing.
+//
+// Call Automation has no such restriction. We attach to the live call with the
+// same connectCall(ServerCallLocator) the voicemail drop uses, and remove the
+// participant server-side. Nothing else about the call is disturbed: the other
+// legs carry on.
+// ─── Conference invitations ──────────────────────────────────────────────────
+//
+// Conference legs are invited from here rather than from the browser, for one
+// reason: a pending invite can only be cancelled with the invitationId that
+// Call Automation's addParticipant returns, and the browser Calling SDK never
+// surfaces one. An invite sent from the browser therefore cannot be cancelled
+// while it is still ringing - removeParticipant only works once the person has
+// answered - which is why a number with no voicemail rang forever.
+//
+// Holding the invitationId here makes "Remove" work in every state: cancel the
+// invitation while it rings, remove the participant once they are on the call.
+
+const CONFERENCE_INVITES = new Map();
+const INVITE_TTL_MS = 30 * 60 * 1000;
+
+const inviteKey = (serverCallId, phoneNumber) =>
+  `${serverCallId}::${String(phoneNumber).replace(/\D/g, '')}`;
+
+const rememberInvite = (serverCallId, phoneNumber, value) => {
+  CONFERENCE_INVITES.set(inviteKey(serverCallId, phoneNumber), { ...value, at: Date.now() });
+
+  // Opportunistic cleanup; these entries are only useful while a call is live.
+  for (const [key, entry] of CONFERENCE_INVITES) {
+    if (Date.now() - entry.at > INVITE_TTL_MS) CONFERENCE_INVITES.delete(key);
+  }
+};
+
+/**
+ * Attach to an in-progress call, retrying until the connection is usable.
+ *
+ * connectCall resolves before the connection can be acted on - the voicemail
+ * drop waits for the CallConnected event for exactly this reason. Probing with
+ * listParticipants is a cheap stand-in for that wait.
+ */
+async function connectAndWait(serverCallId, operationContext, requestId) {
+  const connectResult = await callAutomationClient.connectCall(
+    { kind: 'serverCallLocator', id: serverCallId },
+    `${CALLBACK_BASE_URL}/callbacks`,
+    { operationContext }
+  );
+
+  const callConnectionId =
+    connectResult?.callConnectionProperties?.callConnectionId ||
+    connectResult?.callConnection?.callConnectionId ||
+    null;
+
+  if (!callConnectionId) throw new Error('connectCall returned no callConnectionId');
+
+  const connection = callAutomationClient.getCallConnection(callConnectionId);
+
+  for (let attempt = 1; attempt <= 10; attempt += 1) {
+    try {
+      await connection.listParticipants();
+      return { connection, callConnectionId };
+    } catch (notReady) {
+      if (attempt === 10) {
+        console.error(`[${requestId}] connection never became usable: ${notReady.message}`);
+        throw notReady;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 700));
+    }
+  }
+
+  throw new Error('connection never became usable');
+}
+
+app.post('/participant/add', async (req, res) => {
+  const requestId = Math.random().toString(36).slice(2, 8);
+
+  try {
+    const { serverCallId, phoneNumber, callerId } = req.body || {};
+
+    if (!serverCallId) {
+      return res.status(400).json({ success: false, code: 'MISSING_SERVER_CALL_ID', message: 'serverCallId is required.' });
+    }
+    if (!phoneNumber) {
+      return res.status(400).json({ success: false, code: 'MISSING_PHONE_NUMBER', message: 'phoneNumber is required.' });
+    }
+    if (!callerId) {
+      return res.status(400).json({ success: false, code: 'MISSING_CALLER_ID', message: 'callerId is required for a PSTN invite.' });
+    }
+    if (!CALLBACK_BASE_URL) {
+      return res.status(500).json({ success: false, code: 'NO_CALLBACK_URL', message: 'This server is not configured with a public callback URL.' });
+    }
+
+    const target = String(phoneNumber).trim();
+
+    // An invitation for this number is already outstanding on this call. Sending
+    // a second one makes the phone ring twice from two live invitations, and
+    // cancelling one leaves the other going - which is exactly what happens when
+    // an agent, seeing nothing on screen, presses Add again.
+    const outstanding = CONFERENCE_INVITES.get(inviteKey(serverCallId, target));
+    if (outstanding && outstanding.invitationId && Date.now() - outstanding.at < 3 * 60 * 1000) {
+      console.log(`[${requestId}] [invite] ${target} already has invitation ${outstanding.invitationId}; not inviting again`);
+      return res.status(200).json({
+        success: true,
+        alreadyInvited: true,
+        data: { invitationId: outstanding.invitationId, callConnectionId: outstanding.callConnectionId, phoneNumber: target },
+      });
+    }
+
+    console.log(`[${requestId}] [invite] inviting ${target} to serverCallId ${serverCallId}`);
+
+    let connection;
+    let callConnectionId;
+    try {
+      ({ connection, callConnectionId } = await connectAndWait(serverCallId, `invite-${requestId}`, requestId));
+    } catch (connectError) {
+      console.error(`[${requestId}] [invite] connect failed:`, connectError.message);
+      return res.status(502).json({ success: false, code: 'CONNECT_FAILED', message: connectError.message });
+    }
+
+    try {
+      const result = await connection.addParticipant(
+        {
+          targetParticipant: { phoneNumber: target },
+          sourceCallIdNumber: { phoneNumber: String(callerId).trim() },
+        },
+        // Deliberately longer than the panel's own 45s ring deadline, so the
+        // cancel from the UI is what ends the invite rather than racing an
+        // expiry that has already happened. ACS giving up at 90s is the
+        // backstop if the browser never gets to ask.
+        { invitationTimeoutInSeconds: 90, operationContext: `invite-${requestId}` }
+      );
+
+      const invitationId = result?.invitationId || '';
+      rememberInvite(serverCallId, target, { invitationId, callConnectionId });
+
+      console.log(`[${requestId}] [invite] invited ${target}, invitationId=${invitationId || 'none'}`);
+      return res.status(200).json({ success: true, data: { invitationId, callConnectionId, phoneNumber: target } });
+    } catch (addError) {
+      console.error(`[${requestId}] [invite] addParticipant failed:`, addError.message);
+      return res.status(502).json({ success: false, code: 'ADD_FAILED', message: addError.message });
+    }
+  } catch (error) {
+    console.error(`[${requestId}] [invite] error:`, error.message);
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// Cancel an invitation that is still ringing. This is the only operation that
+// stops a PSTN phone that has not answered yet.
+app.post('/participant/cancel', async (req, res) => {
+  const requestId = Math.random().toString(36).slice(2, 8);
+
+  try {
+    const { serverCallId, phoneNumber } = req.body || {};
+
+    if (!serverCallId || !phoneNumber) {
+      return res.status(400).json({ success: false, code: 'MISSING_FIELDS', message: 'serverCallId and phoneNumber are required.' });
+    }
+
+    const remembered = CONFERENCE_INVITES.get(inviteKey(serverCallId, phoneNumber));
+    if (!remembered || !remembered.invitationId) {
+      // The invite did not come from here, so there is no invitationId to use.
+      console.log(`[${requestId}] [cancel] no invitation on record for ${phoneNumber}`);
+      return res.status(404).json({
+        success: false,
+        code: 'NO_INVITATION',
+        message: 'This participant was not invited by the server, so the invitation cannot be cancelled.',
+      });
+    }
+
+    console.log(`[${requestId}] [cancel] cancelling invitation ${remembered.invitationId} for ${phoneNumber}`);
+
+    try {
+      await callAutomationClient
+        .getCallConnection(remembered.callConnectionId)
+        .cancelAddParticipantOperation(remembered.invitationId);
+
+      CONFERENCE_INVITES.delete(inviteKey(serverCallId, phoneNumber));
+      console.log(`[${requestId}] [cancel] cancelled`);
+      return res.status(200).json({ success: true, data: { cancelled: true, phoneNumber } });
+    } catch (cancelError) {
+      const message = String(cancelError.message || '');
+      console.error(`[${requestId}] [cancel] failed:`, message);
+
+      // Already answered or already gone: nothing left to cancel, and the
+      // caller should fall through to removing the participant instead.
+      return res.status(409).json({ success: false, code: 'CANCEL_FAILED', message });
+    }
+  } catch (error) {
+    console.error(`[${requestId}] [cancel] error:`, error.message);
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+app.post('/participant/remove', async (req, res) => {
+  const requestId = Math.random().toString(36).slice(2, 8);
+
+  try {
+    const { serverCallId, phoneNumber } = req.body || {};
+
+    if (!serverCallId) {
+      return res.status(400).json({ success: false, code: 'MISSING_SERVER_CALL_ID', message: 'serverCallId is required.' });
+    }
+    if (!phoneNumber) {
+      return res.status(400).json({ success: false, code: 'MISSING_PHONE_NUMBER', message: 'phoneNumber is required.' });
+    }
+    if (!CALLBACK_BASE_URL) {
+      return res.status(500).json({ success: false, code: 'NO_CALLBACK_URL', message: 'This server is not configured with a public callback URL.' });
+    }
+
+    const target = String(phoneNumber).trim();
+    const targetDigits = target.replace(/\D/g, '');
+    console.log(`[${requestId}] [remove] removing ${target} from serverCallId ${serverCallId}`);
+
+    let connectResult;
+    try {
+      connectResult = await callAutomationClient.connectCall(
+        { kind: 'serverCallLocator', id: serverCallId },
+        `${CALLBACK_BASE_URL}/callbacks`,
+        { operationContext: `remove-${requestId}` }
+      );
+    } catch (connectError) {
+      console.error(`[${requestId}] [remove] connectCall failed:`, connectError.message);
+      return res.status(502).json({
+        success: false,
+        code: 'CONNECT_FAILED',
+        message: 'Could not attach to the call to remove the participant.',
+      });
+    }
+
+    const callConnectionId =
+      connectResult?.callConnectionProperties?.callConnectionId ||
+      connectResult?.callConnection?.callConnectionId ||
+      null;
+
+    if (!callConnectionId) {
+      console.error(`[${requestId}] [remove] connectCall returned no callConnectionId`);
+      return res.status(502).json({ success: false, code: 'NO_CONNECTION', message: 'Could not attach to the call.' });
+    }
+
+    const connection = callAutomationClient.getCallConnection(callConnectionId);
+
+    /** Is the target still on the call, according to the service itself? */
+    const stillPresent = async () => {
+      try {
+        const roster = await connection.listParticipants();
+        const values = roster?.values || roster?.participants || [];
+        return values.some((participant) => {
+          const id = participant?.identifier || {};
+          const number = id.phoneNumber || id.rawId || '';
+          return String(number).replace(/\D/g, '') === targetDigits;
+        });
+      } catch (listError) {
+        // Cannot see the roster yet - assume still there and keep trying.
+        console.log(`[${requestId}] [remove] listParticipants not ready: ${listError.message}`);
+        return true;
+      }
+    };
+
+    /**
+     * connectCall returns before the connection is usable - the voicemail drop
+     * waits for the CallConnected event for exactly this reason. Rather than
+     * run a whole state machine for one operation, retry until the service
+     * accepts it, and confirm against listParticipants rather than trusting the
+     * call to have worked.
+     */
+    const MAX_ATTEMPTS = 12;
+    const RETRY_DELAY_MS = 1000;
+    let lastError = '';
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+      try {
+        await connection.removeParticipant({ phoneNumber: target });
+        console.log(`[${requestId}] [remove] removeParticipant accepted on attempt ${attempt}`);
+      } catch (removeError) {
+        lastError = String(removeError.message || removeError);
+        console.log(`[${requestId}] [remove] attempt ${attempt} failed: ${lastError}`);
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+
+      if (!(await stillPresent())) {
+        console.log(`[${requestId}] [remove] ${target} is off the call after ${attempt} attempt(s)`);
+
+        // Leave the call ourselves without ending it for anyone else.
+        try {
+          await connection.hangUp(false);
+        } catch (leaveError) {
+          console.log(`[${requestId}] [remove] could not detach: ${leaveError.message}`);
+        }
+
+        return res.status(200).json({ success: true, data: { removed: true, phoneNumber: target, attempts: attempt } });
+      }
+    }
+
+    console.error(`[${requestId}] [remove] gave up after ${MAX_ATTEMPTS} attempts. Last error: ${lastError}`);
+
+    try {
+      await connection.hangUp(false);
+    } catch (leaveError) {
+      console.log(`[${requestId}] [remove] could not detach: ${leaveError.message}`);
+    }
+
+    return res.status(502).json({
+      success: false,
+      code: 'REMOVE_FAILED',
+      message: lastError || 'The participant could not be removed from the call.',
+    });
+  } catch (error) {
+    console.error(`[${requestId}] [remove] error:`, error.message);
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
 app.post('/callbacks', async (req, res) => {
   const requestId = req.requestId;
   

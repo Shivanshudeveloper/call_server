@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "server": "node server.js"
+    "server": "node server.js",
+    "test:parallel": "node tests/parallel-dialer-test.js"
   },
   "keywords": [],
   "author": "",

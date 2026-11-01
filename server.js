@@ -700,6 +700,140 @@ app.post('/callbacks', async (req, res) => {
   }
 });
 
+// ─── Parallel dialer ────────────────────────────────────────────────────────
+//
+// One agent, several phones ringing at once, first answer is put straight
+// through. The engine lives in lib/parallel-dialer.js; these routes only adapt
+// it to HTTP. Everything here is on new paths with its own callback URL, so the
+// voicemail drop, conference invites and /callbacks above are untouched.
+//
+// Needs COGNITIVE_SERVICE_ENDPOINT (the same value the campaign service uses):
+// it is what speaks the message to a lead who answers while the agent is busy,
+// and what listens for voicemail. Without it a session refuses to start.
+const { createParallelDialer } = require('./lib/parallel-dialer');
+
+/**
+ * Identifies THIS running process, so a session can check that the address
+ * Azure will call back on actually leads here.
+ *
+ * Without the check, a callback address pointing at the wrong server - the
+ * production URL while testing locally, or a tunnel that has since changed -
+ * means the agent's browser is rung and joins, and the session then waits
+ * forever for an event that was delivered somewhere else.
+ */
+const PARALLEL_INSTANCE_ID = require('crypto').randomUUID();
+
+app.get('/parallel/ping', (req, res) => {
+  res.status(200).json({ success: true, instanceId: PARALLEL_INSTANCE_ID });
+});
+
+const verifyParallelCallbackUrl = async () => {
+  // Node without fetch cannot run the check; it must not block dialing.
+  if (typeof fetch !== 'function') return { ok: true };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 6000);
+  try {
+    const response = await fetch(`${CALLBACK_BASE_URL}/parallel/ping`, {
+      // ngrok shows browsers a warning page; this skips it for the check.
+      headers: { 'ngrok-skip-browser-warning': 'true' },
+      signal: controller.signal,
+    });
+    if (response.status === 404) {
+      return { ok: false, reason: 'the server there does not have the parallel dialer - it answered 404' };
+    }
+    if (!response.ok) return { ok: false, reason: `it answered ${response.status}` };
+
+    const body = await response.json().catch(() => null);
+    if (!body || body.instanceId !== PARALLEL_INSTANCE_ID) {
+      return { ok: false, reason: 'a different calling server answered' };
+    }
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error.name === 'AbortError' ? 'it did not answer within 6 seconds' : `it could not be reached: ${error.message}`,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+console.log(`[parallel] Azure will send session events to ${CALLBACK_BASE_URL}/parallel/callbacks`);
+
+const parallelDialer = createParallelDialer({
+  client: callAutomationClient,
+  callbackBaseUrl: CALLBACK_BASE_URL,
+  cognitiveServicesEndpoint: String(process.env.COGNITIVE_SERVICE_ENDPOINT || '').trim(),
+  ttsVoice: process.env.TTS_VOICE || 'en-US-JennyNeural',
+  verifyCallbackUrl: verifyParallelCallbackUrl,
+});
+
+// Ends sessions whose browser has gone away, so a closed tab cannot leave a
+// call up that a lead might answer into.
+setInterval(() => {
+  parallelDialer.sweep().catch((error) => console.error('[parallel] sweep failed:', error.message));
+}, 15000).unref();
+
+const sendParallelError = (res, error) => {
+  if (!error.status) console.error('[parallel] unexpected error:', error);
+  return res.status(error.status || 500).json({
+    success: false,
+    code: error.code || 'INTERNAL_ERROR',
+    message: error.status ? error.message : 'Internal server error',
+  });
+};
+
+const parallelRoute = (handler) => async (req, res) => {
+  try {
+    const data = await handler(req);
+    return res.status(200).json({ success: true, data });
+  } catch (error) {
+    return sendParallelError(res, error);
+  }
+};
+
+app.post('/parallel/session', parallelRoute((req) => parallelDialer.startSession(req.body || {})));
+
+app.get('/parallel/session/:sessionId', parallelRoute((req) => parallelDialer.getSession(req.params.sessionId)));
+
+app.post(
+  '/parallel/session/:sessionId/round',
+  parallelRoute((req) => parallelDialer.startRound(req.params.sessionId, (req.body || {}).leads))
+);
+
+app.post(
+  '/parallel/session/:sessionId/leads/:legId/end',
+  parallelRoute((req) => parallelDialer.endLead(req.params.sessionId, req.params.legId))
+);
+
+app.post(
+  '/parallel/session/:sessionId/leads/:legId/voicemail',
+  parallelRoute((req) => parallelDialer.dropVoicemail(req.params.sessionId, req.params.legId, req.body || {}))
+);
+
+app.post('/parallel/session/:sessionId/end', parallelRoute((req) => parallelDialer.endSession(req.params.sessionId)));
+
+// Azure posts session events here. CloudEvents arrive with their own content
+// type, which the global JSON parser ignores, so this route reads both.
+app.post(
+  '/parallel/callbacks',
+  express.json({ type: ['application/json', 'application/cloudevents+json', 'application/cloudevents-batch+json'] }),
+  async (req, res) => {
+    const events = Array.isArray(req.body) ? req.body : [req.body];
+    for (const event of events) {
+      try {
+        await parallelDialer.handleEvent(event, req.query || {});
+      } catch (error) {
+        console.error('[parallel] event failed:', (event && (event.type || event.eventType)) || 'unknown', error.message);
+      }
+    }
+    // Always acknowledged: Azure retries anything else, and one odd event must
+    // not be redelivered forever.
+    res.sendStatus(200);
+  }
+);
+
 // Function to convert webm to PCM buffer - handles concurrent conversions
 const convertWebmToPcm = (webmBuffer, requestId) => {
   return new Promise((resolve, reject) => {

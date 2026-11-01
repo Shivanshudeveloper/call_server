@@ -113,11 +113,25 @@ app.get('/token', async (req, res) => {
 const VOICEMAIL_DROPS = new Map();
 const DROP_TTL_MS = 10 * 60 * 1000;
 
+/**
+ * A setting as a person typed it, minus the wrapping they did not mean.
+ *
+ * Locally, dotenv strips quotes around values. Azure App Service settings keep
+ * them, so a line copied from .env - KEY="https://..." - arrives with the quote
+ * characters as part of the value. Azure then refuses the URL with nothing more
+ * than "Invalid request".
+ */
+const unquote = (value) =>
+  String(value || '')
+    .trim()
+    .replace(/^(["'])(.*)\1$/, '$2')
+    .trim();
+
 // ACS must be able to reach this to deliver events, so it has to be the public
 // URL of THIS service, not localhost. Set it in config.js; an environment
 // variable still wins where one exists, so a deployed host can override without
 // editing code.
-const CALLBACK_BASE_URL = String(
+const CALLBACK_BASE_URL = unquote(
   process.env.CALLBACK_BASE_URL || appConfig.CALLBACK_BASE_URL || ''
 ).replace(/\/+$/, '');
 
@@ -764,7 +778,7 @@ console.log(`[parallel] Azure will send session events to ${CALLBACK_BASE_URL}/p
 const parallelDialer = createParallelDialer({
   client: callAutomationClient,
   callbackBaseUrl: CALLBACK_BASE_URL,
-  cognitiveServicesEndpoint: String(process.env.COGNITIVE_SERVICE_ENDPOINT || '').trim(),
+  cognitiveServicesEndpoint: unquote(process.env.COGNITIVE_SERVICE_ENDPOINT),
   ttsVoice: process.env.TTS_VOICE || 'en-US-JennyNeural',
   verifyCallbackUrl: verifyParallelCallbackUrl,
 });

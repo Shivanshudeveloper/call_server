@@ -4,6 +4,7 @@
 const path = require('path');
 const {
     createParallelDialer,
+    describeAzureError,
     labelForFailure,
     phoneOf,
     userOf,
@@ -53,7 +54,13 @@ const fakeClient = {
     createCall: async (target, url, opts) => {
         calls.push({ op: 'createCall', target, url, opts });
         if (options.createFails) throw new Error('agent unreachable');
-        return { callConnectionProperties: { callConnectionId: 'conn-1', serverCallId: 'server-1' } };
+        // Real Azure returns no serverCallId at creation; tests opt into that.
+        return {
+            callConnectionProperties: {
+                callConnectionId: 'conn-1',
+                serverCallId: options.noServerCallIdAtCreate ? '' : 'server-1',
+            },
+        };
     },
     getCallConnection: () => ({
         addParticipant: async (invite, opts) => {
@@ -71,6 +78,7 @@ const fakeClient = {
         hangUp: async (forEveryone) => {
             calls.push({ op: 'hangUp', forEveryone });
         },
+        getCallConnectionProperties: async () => ({ serverCallId: options.propertiesServerCallId || '' }),
         getCallMedia: () => ({
             play: async (sources, playTo, opts) => {
                 calls.push({ op: 'play', sources, playTo, opts });
@@ -239,6 +247,59 @@ const rejects = async (promise) => {
     snap = dialer.getSession(snap.sessionId);
     check('Azure failing to ring the agent fails the session', snap.state === 'failed', snap.state);
     check("with Azure's own reason", /Forbidden/.test(snap.error), snap.error);
+
+    // ════ settings typed with quotes ════════════════════════════════════
+    // Azure App Service keeps the quotes a local .env drops; Azure then
+    // refuses the endpoint with a bare "Invalid request".
+    reset();
+    err = await rejects(make({ cognitiveServicesEndpoint: '"https://speech.example.com/"' }).startSession(startArgs()));
+    check('a quoted speech endpoint is caught before Azure sees it', err && err.code === 'SPEECH_ENDPOINT_INVALID', err && err.code);
+    check('and the message says to look for quotes', err && /quote/i.test(err.message), err && err.message);
+    check('nothing is rung with a malformed endpoint', opsOf('createCall').length === 0);
+
+    reset();
+    err = await rejects(make({ cognitiveServicesEndpoint: 'https://speech.example.com/ extra' }).startSession(startArgs()));
+    check('an endpoint with a space in it is refused', err && err.code === 'SPEECH_ENDPOINT_INVALID', err && err.code);
+
+    reset();
+    err = await rejects(make({ cognitiveServicesEndpoint: 'speech.example.com' }).startSession(startArgs()));
+    check('an endpoint without https is refused', err && err.code === 'SPEECH_ENDPOINT_INVALID', err && err.code);
+
+    // Azure's refusals are reported in full.
+    const refusal = Object.assign(new Error('Invalid request'), { statusCode: 400, details: { message: 'cognitiveServicesEndpoint is not valid' } });
+    const described = describeAzureError(refusal);
+    check('a refusal carries its status code', described.startsWith('400 '), described);
+    check("and Azure's detailed reason", described.includes('cognitiveServicesEndpoint is not valid'), described);
+    check('and a hint about the usual cause', /no quotes or spaces/.test(described), described);
+    check('a refusal with no detail still reads cleanly', describeAzureError(new Error('Boom')) === 'Boom', describeAzureError(new Error('Boom')));
+    check('nothing at all still produces a message', describeAzureError(undefined) === 'unknown error');
+
+    // ════ the serverCallId recording needs ══════════════════════════════
+    // Seen live: Azure returns no serverCallId when the call is created, so it
+    // stayed empty and no lead was ever recorded.
+    reset();
+    options.noServerCallIdAtCreate = true;
+    dialer = make();
+    snap = await dialer.startSession(startArgs());
+    check('at creation, like real Azure, there is no serverCallId yet', snap.serverCallId === '', snap.serverCallId);
+    await dialer.handleEvent(ev('CallConnected', { operationContext: `pd-session:${snap.sessionId}`, serverCallId: 'srv-from-event' }));
+    check('it is taken from the first event that carries it', dialer.getSession(snap.sessionId).serverCallId === 'srv-from-event');
+
+    reset();
+    options.noServerCallIdAtCreate = true;
+    options.propertiesServerCallId = 'srv-from-properties';
+    dialer = make();
+    snap = await dialer.startSession(startArgs());
+    await dialer.handleEvent(ev('CallConnected', { operationContext: `pd-session:${snap.sessionId}` }));
+    check('if no event carries it, Azure is asked for it on connect', dialer.getSession(snap.sessionId).serverCallId === 'srv-from-properties');
+
+    reset();
+    options.noServerCallIdAtCreate = true;
+    dialer = make();
+    snap = await dialer.startSession(startArgs());
+    await dialer.handleEvent(ev('CallConnected', { operationContext: `pd-session:${snap.sessionId}`, serverCallId: 'first' }));
+    await dialer.handleEvent(ev('ParticipantsUpdated', { serverCallId: 'something-else', participants: [] }));
+    check('once known, it is not overwritten', dialer.getSession(snap.sessionId).serverCallId === 'first');
 
     // ════ the agent picks up ═════════════════════════════════════════════
     reset();

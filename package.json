@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "server": "node server.js",
-    "test:parallel": "node tests/parallel-dialer-test.js"
+    "test:parallel": "node tests/parallel-dialer-test.js",
+    "test:forwarding": "node tests/call-forwarding-test.js"
   },
   "keywords": [],
   "author": "",

@@ -848,6 +848,134 @@ app.post(
   }
 );
 
+// ─── Call forwarding (Call Routing) ─────────────────────────────────────────
+//
+// A call to an organization's number that is set to "Forward to a phone" is
+// handed here by the backend, which owns the Event Grid webhook and decides
+// which calls forward. This server answers it and joins the chosen phone to the
+// call. Everything is on new /routing paths with its own callback URL, so the
+// browser popup, the parallel dialer and /callbacks above are untouched.
+//
+// Needs CALL_ROUTING_SECRET, the same value as the backend's: every /routing
+// request from the backend carries it, because these routes can place phone
+// calls. Without it the routes refuse and the backend keeps using the popup.
+const { createCallForwarder, ringbackWav, secretMatches } = require('./lib/call-forwarding');
+
+const CALL_ROUTING_SECRET = unquote(process.env.CALL_ROUTING_SECRET);
+const BACKEND_API_URL = unquote(
+  process.env.BACKEND_API_URL || 'https://phonecallingbackendmain-ffafe3f3fcdwhtff.centralus-01.azurewebsites.net'
+).replace(/\/+$/, '');
+
+if (!CALL_ROUTING_SECRET) {
+  console.warn('[forward] CALL_ROUTING_SECRET is not set - call forwarding is off and incoming calls keep ringing in the browser');
+} else {
+  console.log(`[forward] call forwarding is on; outcomes are reported to ${BACKEND_API_URL}`);
+}
+
+const RINGBACK = ringbackWav();
+app.get('/routing/ringback.wav', (req, res) => {
+  res.set('Content-Type', 'audio/wav');
+  res.set('Cache-Control', 'public, max-age=86400');
+  res.send(RINGBACK);
+});
+
+// Whether Azure's events for a call would actually reach this process. Checked
+// in the background and reused, so answering a call rarely waits on it.
+const callbackCheck = { ok: null, checkedAt: 0, reason: '' };
+const refreshCallbackCheck = async () => {
+  const result = await verifyParallelCallbackUrl();
+  callbackCheck.ok = result.ok;
+  callbackCheck.reason = result.reason || '';
+  callbackCheck.checkedAt = Date.now();
+  if (!result.ok) console.warn(`[forward] ${CALLBACK_BASE_URL} does not lead to this server (${result.reason})`);
+  return result.ok;
+};
+if (CALL_ROUTING_SECRET) {
+  setTimeout(() => refreshCallbackCheck().catch(() => {}), 3000).unref();
+  setInterval(() => refreshCallbackCheck().catch(() => {}), 5 * 60 * 1000).unref();
+}
+const isCallbackReachable = async () => {
+  if (callbackCheck.ok === null || Date.now() - callbackCheck.checkedAt > 10 * 60 * 1000) {
+    return refreshCallbackCheck().catch(() => false);
+  }
+  return callbackCheck.ok;
+};
+
+const reportForwardedCall = async (callId, payload) => {
+  if (typeof fetch !== 'function') return;
+  const send = async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const response = await fetch(`${BACKEND_API_URL}/api/v1/callrouting/internal/calls/${encodeURIComponent(callId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-call-routing-secret': CALL_ROUTING_SECRET },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`backend answered ${response.status}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  try {
+    await send();
+  } catch (error) {
+    // One retry: the final report is what bills the call and closes its row.
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await send();
+  }
+};
+
+const callForwarder = createCallForwarder({
+  client: callAutomationClient,
+  callbackBaseUrl: CALLBACK_BASE_URL,
+  cognitiveServicesEndpoint: unquote(process.env.COGNITIVE_SERVICE_ENDPOINT),
+  ttsVoice: process.env.TTS_VOICE || 'en-US-JennyNeural',
+  ringbackUrl: `${CALLBACK_BASE_URL}/routing/ringback.wav`,
+  reportCall: reportForwardedCall,
+  isCallbackReachable,
+});
+
+setInterval(() => callForwarder.sweep(), 60000).unref();
+
+/** Only the backend may use these routes: they answer calls and ring phones. */
+const requireRoutingSecret = (req, res, next) => {
+  if (!CALL_ROUTING_SECRET) {
+    return res.status(503).json({ success: false, code: 'FORWARDING_OFF', message: 'Call forwarding is not configured on this server' });
+  }
+  if (!secretMatches(CALL_ROUTING_SECRET, req.get('x-call-routing-secret'))) {
+    return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Not allowed' });
+  }
+  return next();
+};
+
+app.post('/routing/forward', requireRoutingSecret, parallelRoute((req) => callForwarder.forward(req.body || {})));
+app.post('/routing/test', requireRoutingSecret, parallelRoute((req) => callForwarder.testCall(req.body || {})));
+app.get(
+  '/routing/status',
+  requireRoutingSecret,
+  parallelRoute(async () => ({ ...callForwarder.describe(), callbackBaseUrl: CALLBACK_BASE_URL, callbacksReachable: callbackCheck.ok }))
+);
+
+app.post(
+  '/routing/callbacks',
+  express.json({ type: ['application/json', 'application/cloudevents+json', 'application/cloudevents-batch+json'] }),
+  async (req, res) => {
+    const events = Array.isArray(req.body) ? req.body : [req.body];
+    for (const event of events) {
+      try {
+        await callForwarder.handleEvent(event, req.query || {});
+      } catch (error) {
+        console.error('[forward] event failed:', (event && (event.type || event.eventType)) || 'unknown', error.message);
+      }
+    }
+    // Always acknowledged: a retried AddParticipantSucceeded must never be
+    // processed twice.
+    res.sendStatus(200);
+  }
+);
+
 // Function to convert webm to PCM buffer - handles concurrent conversions
 const convertWebmToPcm = (webmBuffer, requestId) => {
   return new Promise((resolve, reject) => {
